@@ -1,0 +1,211 @@
+import requests as req
+from datetime import datetime
+from models import supabase, SUPABASE_URL, SUPABASE_KEY, SERVICE_KEY
+from services.rating_engine import calculate_rating, load_scale_meta
+
+
+def _compute_live_score(employee_id, year, period):
+    """Recompute a period's total score exactly like
+    GET /api/performance/<user>/<year>/<period> (the My Performance page's
+    source): trust the stored rating/score only when BOTH are present,
+    otherwise recalculate from the record + KPI scale metadata via
+    calculate_rating(). performance_summaries.total_score is a cache that
+    silently drops records missing a stored score, so it can go stale —
+    this keeps the profile number in lockstep with My Performance instead."""
+    records = supabase.table("performance_records")\
+        .select("*")\
+        .eq("user_id", employee_id)\
+        .eq("year", year)\
+        .eq("period", period)\
+        .execute().data or []
+
+    if not records:
+        return None
+
+    mappings_by_obj, rules_by_mapping, obj_by_id, _ = load_scale_meta()
+
+    total = 0.0
+    for rec in records:
+        obj_id   = rec["objective_id"]
+        obj      = obj_by_id.get(obj_id, {})
+        mapping  = mappings_by_obj.get(obj_id, {})
+        brackets = rules_by_mapping.get(mapping.get("id"), [])
+        weight   = float(obj.get("weight", 0))
+
+        stored_rating = rec.get("rating")
+        stored_score  = rec.get("score")
+
+        if stored_rating is not None and stored_score is not None:
+            score = float(stored_score)
+        else:
+            rating = calculate_rating(rec, mapping, brackets)
+            score  = round(rating * (weight / 100), 4)
+
+        total += score
+
+    return round(total, 2)
+
+
+def get_profile(employee_id):
+    try:
+        # ── Fetch user profile ──
+        result = supabase.table("users")\
+            .select("*, designations!fk_designation(name), departments(name)")\
+            .eq("id", employee_id)\
+            .execute()
+
+        if not result.data:
+            return {"message": "User not found"}, 404
+
+        profile = result.data[0]
+        if profile.get("designations"):
+            profile["designation"] = profile["designations"]["name"]
+        if profile.get("departments"):
+            profile["department"] = profile["departments"]["name"]
+
+        # ── Fetch latest performance score ──
+        # Mirrors My Performance page: same performance_summaries table,
+        # same user_id/period/pms_year columns. Prefers H2 over H1 when a
+        # user has both; falls back to H1 only if no H2 row exists at all.
+        performance_score = None
+        cycle_period = None
+        cycle_year = None
+        try:
+            for period in ("H2", "H1"):
+                perf_res = supabase.table("performance_summaries")\
+                    .select("total_score, pms_year")\
+                    .eq("user_id", employee_id)\
+                    .eq("period", period)\
+                    .order("pms_year", desc=True)\
+                    .order("updated_at", desc=True)\
+                    .limit(1)\
+                    .execute()
+                if perf_res.data:
+                    performance_score = perf_res.data[0]["total_score"]
+                    cycle_year = perf_res.data[0]["pms_year"]
+                    cycle_period = period
+                    break
+
+            # performance_summaries can be a stale cache (e.g. records with a
+            # rating but no stored score get dropped from its total). Prefer
+            # a live recomputation so this always matches My Performance.
+            if cycle_period:
+                live_score = _compute_live_score(employee_id, cycle_year, cycle_period)
+                if live_score is not None:
+                    performance_score = live_score
+        except Exception:
+            pass
+
+        # ── Fetch latest potential block ──
+        potential_block = None
+        try:
+            pot_res = supabase.table("potential_assessments")\
+                .select("talent_block")\
+                .eq("employee_id", employee_id)\
+                .order("created_at", desc=True)\
+                .limit(1)\
+                .execute()
+            if pot_res.data:
+                potential_block = pot_res.data[0]["talent_block"]
+        except Exception:
+            pass
+
+        profile["performance_score"] = performance_score
+        profile["potential_block"]   = potential_block
+        profile["cycle_period"]      = cycle_period
+        profile["cycle_year"]        = cycle_year
+
+        return {"profile": profile}, 200
+    except Exception as e:
+        print(f"[ERROR] get_profile: {e}")
+        return {"message": "Something went wrong. Please try again."}, 500
+
+
+def upload_avatar(request):
+    try:
+        employee_id = request.form.get("employee_id")
+        file        = request.files.get("file")
+
+        if not file or not employee_id:
+            return {"message": "File and employee_id required"}, 400
+
+        allowed_types = ["image/jpeg", "image/png", "image/webp"]
+        if file.content_type not in allowed_types:
+            return {"message": "Only JPG, PNG, WebP allowed"}, 400
+
+        file_bytes = file.read()
+        if len(file_bytes) > 2 * 1024 * 1024:
+            return {"message": "Image must be under 2MB"}, 400
+
+        ext       = file.filename.split(".")[-1].lower()
+        file_name = f"{employee_id}-{int(datetime.now().timestamp())}.{ext}"
+
+        user_res = supabase.table("users")\
+            .select("avatar_url")\
+            .eq("id", employee_id)\
+            .execute()
+
+        if user_res.data and user_res.data[0].get("avatar_url"):
+            old_url      = user_res.data[0]["avatar_url"]
+            old_filename = old_url.split("/avatars/")[-1]
+            req.delete(
+                f"{SUPABASE_URL}/storage/v1/object/avatars/{old_filename}",
+                headers={
+                    "apikey":        SERVICE_KEY,
+                    "Authorization": f"Bearer {SERVICE_KEY}",
+                }
+            )
+
+        upload_res = req.post(
+            f"{SUPABASE_URL}/storage/v1/object/avatars/{file_name}",
+            headers={
+                "apikey":        SERVICE_KEY,
+                "Authorization": f"Bearer {SERVICE_KEY}",
+                "Content-Type":  file.content_type,
+            },
+            data=file_bytes
+        )
+
+        if upload_res.status_code not in (200, 201):
+            return {"message": f"Upload failed: {upload_res.text}"}, 400
+
+        avatar_url = f"{SUPABASE_URL}/storage/v1/object/public/avatars/{file_name}"
+
+        supabase.table("users")\
+            .update({"avatar_url": avatar_url})\
+            .eq("id", employee_id)\
+            .execute()
+
+        return {"avatar_url": avatar_url}, 200
+    except Exception as e:
+        print(f"[ERROR] upload_avatar: {e}")
+        return {"message": "Something went wrong. Please try again."}, 500
+
+
+def remove_avatar(employee_id):
+    try:
+        user_res = supabase.table("users")\
+            .select("avatar_url")\
+            .eq("id", employee_id)\
+            .execute()
+
+        if user_res.data and user_res.data[0].get("avatar_url"):
+            old_url      = user_res.data[0]["avatar_url"]
+            old_filename = old_url.split("/avatars/")[-1]
+            req.delete(
+                f"{SUPABASE_URL}/storage/v1/object/avatars/{old_filename}",
+                headers={
+                    "apikey":        SERVICE_KEY,
+                    "Authorization": f"Bearer {SERVICE_KEY}",
+                }
+            )
+
+        supabase.table("users")\
+            .update({"avatar_url": None})\
+            .eq("id", employee_id)\
+            .execute()
+
+        return {"message": "Avatar removed"}, 200
+    except Exception as e:
+        print(f"[ERROR] remove_avatar: {e}")
+        return {"message": "Something went wrong. Please try again."}, 500

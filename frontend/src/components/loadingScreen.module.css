@@ -1,0 +1,63 @@
+/* ── Skeleton shimmer (inline loading) ── */
+.skeleton {
+  width: 100%;
+  padding: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.skeletonRow {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 12px;
+  padding: 20px 24px;
+  box-shadow: 0 4px 16px rgba(28, 57, 142, 0.07);
+}
+
+.skeletonAvatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: linear-gradient(90deg, #e8edf8 25%, #d0d9ef 50%, #e8edf8 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  flex-shrink: 0;
+}
+
+.skeletonLines {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeletonLine {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #e8edf8 25%, #d0d9ef 50%, #e8edf8 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+.skeletonLine:first-child { width: 55%; animation-delay: 0.05s; }
+.skeletonLine:last-child  { width: 35%; animation-delay: 0.10s; }
+
+.skeletonBadge {
+  width: 80px;
+  height: 26px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #e8edf8 25%, #d0d9ef 50%, #e8edf8 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  animation-delay: 0.15s;
+}
+
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
